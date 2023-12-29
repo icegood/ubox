@@ -33,6 +33,7 @@
 #include <libubox/ustream.h>
 #include <libubox/utils.h>
 
+#include <syslog.h>
 #include "syslog.h"
 
 #define LOG_DEFAULT_SIZE	(16 * 1024)
@@ -49,6 +50,7 @@ static struct log_head *log, *log_end, *oldest, *newest;
 static int current_id = 0;
 static regex_t pat_prio;
 static regex_t pat_tstamp;
+int max_log_priority;
 static struct udebug ud;
 static struct udebug_buf udb_kernel, udb_user, udb_debug;
 static const struct udebug_buf_meta meta_kernel = {
@@ -148,7 +150,7 @@ log_add(char *buf, int size, int source)
 {
 	regmatch_t matches[3];
 	struct log_head *next;
-	int priority = 0;
+	int fac_priority = 0;
 	int ret;
 	char *c;
 
@@ -174,7 +176,7 @@ log_add(char *buf, int size, int source)
 	/* strip the priority */
 	ret = regexec(&pat_prio, buf, 3, matches, 0);
 	if (!ret) {
-		priority = atoi(&buf[matches[1].rm_so]);
+		fac_priority = atoi(&buf[matches[1].rm_so]);
 		size -= matches[2].rm_so;
 		buf += matches[2].rm_so;
 	}
@@ -185,11 +187,15 @@ log_add(char *buf, int size, int source)
 		buf += SYSLOG_PADDING;
 	}
 
-	log_add_udebug(priority, buf, size, source);
+	log_add_udebug(fac_priority, buf, size, source);
 
 	/* debug message */
-	if ((priority & LOG_FACMASK) == LOG_LOCAL7)
+	if ((fac_priority & LOG_FACMASK) == LOG_LOCAL7)
 		return;
+	
+	if (LOG_PRI(fac_priority) > max_log_priority) {
+		return;
+	}
 
 	/* find new oldest entry */
 	next = log_next(newest, size);
@@ -197,7 +203,7 @@ log_add(char *buf, int size, int source)
 		while ((oldest > newest) && (oldest <= next) && (oldest != log))
 			oldest = log_next(oldest, oldest->size);
 	} else {
-		//fprintf(stderr, "Log wrap\n");
+		fprintf(stderr, "Log buffer wrap\n");
 		newest->size = 0;
 		next = log_next(log, size);
 		for (oldest = log; oldest <= next; oldest = log_next(oldest, oldest->size))
@@ -208,7 +214,7 @@ log_add(char *buf, int size, int source)
 	/* add the log message */
 	newest->size = size;
 	newest->id = current_id++;
-	newest->priority = priority;
+	newest->priority = fac_priority;
 	newest->source = source;
 	clock_gettime(CLOCK_REALTIME, &newest->ts);
 	strcpy(newest->data, buf);
@@ -297,6 +303,8 @@ syslog_open(void)
 	}
 	chmod(log_dev, 0666);
 	uloop_fd_add(&syslog_fd, ULOOP_READ | ULOOP_EDGE_TRIGGER);
+
+	fprintf(stderr,"Socket '%s' opened\n", log_dev);
 
 	return 0;
 }

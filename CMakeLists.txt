@@ -47,11 +47,10 @@ INSTALL(TARGETS validate
 	LIBRARY DESTINATION lib
 )
 
-FIND_PATH(uci_include_dir uci.h)
-INCLUDE_DIRECTORIES(${uci_include_dir})
-
 ADD_EXECUTABLE(validate_data validate/cli.c)
 TARGET_LINK_LIBRARIES(validate_data ubox uci validate)
+FIND_PATH(uci_include_dir uci.h)
+TARGET_INCLUDE_DIRECTORIES(validate_data PRIVATE ${uci_include_dir})
 INSTALL(TARGETS validate_data
 	RUNTIME DESTINATION sbin
 )
@@ -62,8 +61,9 @@ INSTALL(TARGETS logd
 	RUNTIME DESTINATION sbin
 )
 
-ADD_EXECUTABLE(logread log/logread.c)
+ADD_EXECUTABLE(logread log/logread.c log/logread_socket.c log/logread_file.c)
 TARGET_LINK_LIBRARIES(logread ubox ubus ${json} blobmsg_json)
+# TARGET_INCLUDE_DIRECTORIES(logread PRIVATE log)
 INSTALL(TARGETS logread
 	RUNTIME DESTINATION sbin
 )

@@ -14,6 +14,8 @@
 #ifndef __SYSLOG_H
 #define __SYSLOG_H
 
+#include <time.h>
+
 #define LOG_LINE_SIZE		1024
 
 #include <udebug.h>
@@ -33,6 +35,8 @@ struct log_head {
 	struct timespec ts;
 	char data[];
 };
+
+extern int max_log_priority;
 
 void log_init(int log_size);
 void log_shutdown(void);

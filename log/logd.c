@@ -138,6 +138,7 @@ read_log(struct ubus_context *ctx, struct ubus_object *obj,
 			log_fill_msg(&b, l);
 			l = log_list(count, l);
 			ret = ustream_write(&cl->s.stream, (void *) b.head, blob_len(b.head) + sizeof(struct blob_attr), false);
+			blob_buf_free(&b);
 			if (ret < 0)
 				break;
 		}
@@ -157,8 +158,8 @@ read_log(struct ubus_context *ctx, struct ubus_object *obj,
 		}
 		blobmsg_close_array(&b, c);
 		ubus_send_reply(ctx, req, b.head);
+		blob_buf_free(&b);
 	}
-	blob_buf_free(&b);
 	return 0;
 }
 
@@ -213,11 +214,7 @@ ubus_notify_log(struct log_head *l)
 		return;
 
 	blob_buf_init(&b, 0);
-	blobmsg_add_string(&b, "msg", l->data);
-	blobmsg_add_u32(&b, "id", l->id);
-	blobmsg_add_u32(&b, "priority", l->priority);
-	blobmsg_add_u32(&b, "source", l->source);
-	blobmsg_add_u64(&b, "time", (((__u64) l->ts.tv_sec) * 1000) + (l->ts.tv_nsec / 1000000));
+	log_fill_msg(&b, l);
 
 	if (log_object.has_subscribers)
 		ubus_notify(&conn.ctx, &log_object, "message", b.head, -1);
@@ -241,20 +238,34 @@ ubus_connect_handler(struct ubus_context *ctx)
 	fprintf(stderr, "log: connected to ubus\n");
 }
 
+static int usage(const char *prog)
+{
+	fprintf(stderr, "Usage: %s [options]\n"
+		"Options:\n"
+		"    -S <buffer size>	Size of buffer (Kb) to cache logs in memory\n"
+		"    -Y	<priority>	handle only messages with given priority (0-7) or below\n"
+		"\n", prog);
+	return 1;
+}
+
 int
 main(int argc, char **argv)
 {
 	int ch, log_size = 16;
 	struct passwd *p = NULL;
 
-	signal(SIGPIPE, SIG_IGN);
-	while ((ch = getopt(argc, argv, "S:")) != -1) {
+	while ((ch = getopt(argc, argv, "S:Y:")) != -1) {
 		switch (ch) {
 		case 'S':
 			log_size = atoi(optarg);
 			if (log_size < 1)
 				log_size = 16;
 			break;
+		case 'Y':
+			max_log_priority = atoi(optarg);
+			break;
+		default:
+			return usage(*argv);
 		}
 	}
 	log_size *= 1024;
@@ -277,6 +288,7 @@ main(int argc, char **argv)
 		}
 	}
 	uloop_run();
+	fprintf(stderr, "Stopped\n");
 	udebug_ubus_free(&udebug);
 	log_shutdown();
 	uloop_done();
