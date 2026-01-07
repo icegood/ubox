@@ -295,7 +295,7 @@ klog_open(void)
 static int
 syslog_open(void)
 {
-	unlink(log_dev);
+	//unlink(log_dev);
 	syslog_fd.fd = usock(USOCK_UNIX | USOCK_UDP | USOCK_SERVER | USOCK_NONBLOCK, log_dev, NULL);
 	if (syslog_fd.fd < 0) {
 		fprintf(stderr,"Failed to open %s\n", log_dev);
