@@ -53,17 +53,22 @@ struct param {
 };
 
 enum {
-	BUILTIN,
-	SCANNED,
-	PROBE,
-	LOADED,
-	BLACKLISTED,
+	BUILTIN = 1 << 0,
+	SCANNED = 1 << 1,
+	PROBE = 1 << 2,
+	LOADED = 1 << 3,
+	BLACKLISTED = 1 << 4,
 };
 
+const char* BLACKLISTED_STATE="\x01";
+
 struct module {
-	char *name;
-	char *depends;
+	char *name; // as part of path with .ko. Suitable for insert
+	char *internal_name; // as internal kernel representation fronm /proc. Suitable for delete
+	char *depends; // forward depends parsed from elf
+	char *rdepends; // reverse depends found in /proc
 	char *opts;
+	
 
 	int size;
 	int usage;
@@ -292,30 +297,42 @@ alloc_module_node(const char *name, struct module *m, bool is_alias)
 
 static int avl_modcmp(const void *k1, const void *k2, void *ptr);
 
+static bool has_deps(const char *deps) {
+	return deps && (deps[0] != '-') && (deps[0] != '\0');
+}
+
+static char* add_deps(struct module *m, const char *depends) {
+	char *_dep, *result;
+
+	if (!depends) {
+		return NULL;
+	}
+
+	_dep = calloc(1, strlen(depends) + 2); 
+	result = strcpy(_dep, depends);
+	while (*_dep) {
+		if (*_dep == ',')
+			*_dep = '\0';
+		_dep++;
+	}
+	return result;
+}
+
 static struct module *
 alloc_module(const char *name, const char * const *aliases, int naliases, const char *depends, int size)
 {
 	struct module *m;
-	char *_name, *_dep;
+	char *_name;
 	int i;
 
-	m = calloc_a(sizeof(*m),
-		&_name, strlen(name) + 1,
-		&_dep, depends ? strlen(depends) + 2 : 0);
+	m = calloc_a(sizeof(*m),&_name, strlen(name) + 1);
 	if (!m)
 		return NULL;
 
 	m->name = strcpy(_name, name);
+	m->internal_name = strdup(m->name);
 	m->opts = 0;
-
-	if (depends) {
-		m->depends = strcpy(_dep, depends);
-		while (*_dep) {
-			if (*_dep == ',')
-				*_dep = '\0';
-			_dep++;
-		}
-	}
+	m->depends = add_deps(m, depends);
 	m->size = size;
 
 	m->refcnt = 0;
@@ -323,6 +340,8 @@ alloc_module(const char *name, const char * const *aliases, int naliases, const 
 	for (i = 0; i < naliases; i++)
 		if (avl_modcmp(m->name, aliases[i], NULL))
 			alloc_module_node(aliases[i], m, true);
+
+	m->state = 0;
 
 	return m;
 }
@@ -332,6 +351,45 @@ static void free_module(struct module *m)
 	if (m->opts)
 		free(m->opts);
 	free(m);
+}
+
+static int unload_blacklisted(struct module *m) {
+	if (has_deps(m->rdepends)) {
+		char *dep = m->rdepends;
+		while (*dep) {
+			// dont't get how it works i.e could find usb-common.ko by usb_common
+			struct module *d = find_module(get_module_name(dep));
+			if (d) {
+				// for dependencies not not try to load them again a bit later:
+				d->state |= BLACKLISTED;
+				if ((d->state & LOADED) && unload_blacklisted(d)) {
+					return 1;
+				}
+			} else {
+				ULOG_WARN("Dependent module '%s' not found\n", dep);
+				return 1;
+			}
+			dep += strlen(dep) + 1;
+		}
+	}
+
+	if (m->state & BUILTIN) {
+		ULOG_WARN("Cannot unload builtin module '%s'\n", m->name);
+		return 1;
+	}
+
+	if (!(m->state & LOADED)) {
+		return 0;
+	}
+	/* unload this module */
+	int res = syscall(__NR_delete_module, m->internal_name, 0);
+	if (res == 0) {
+		m->state &= ~LOADED;
+		ULOG_WARN("Module '%s (%s)' unloaded\n", m->internal_name, m->name);
+	} else {
+		ULOG_ERR("Failed to unload module '%s (%s)': %d\n", m->internal_name, m->name, res);
+	}
+	return res;
 }
 
 static int scan_loaded_modules(void)
@@ -350,27 +408,32 @@ static int scan_loaded_modules(void)
 	while (getline(&buf, &buf_len, fp) > 0) {
 		struct module m;
 		struct module *n;
+		char *saveptr;
 
-		m.name = strtok(buf, " ");
-		m.size = atoi(strtok(NULL, " "));
-		m.usage = atoi(strtok(NULL, " "));
-		m.depends = strtok(NULL, " ");
+		m.name = strtok_r(buf, " ", &saveptr);
+		m.size = atoi(strtok_r(NULL, " ", &saveptr));
+		m.usage = atoi(strtok_r(NULL, " ", &saveptr));
+		m.rdepends = strtok_r(NULL, " ", &saveptr);
 
-		if (!m.name || !m.depends)
+		if (!m.name || !m.rdepends)
 			continue;
 
 		n = find_module(m.name);
 		if (!n) {
 			/* possibly a module outside /lib/modules/<ver>/ */
-			n = alloc_module(m.name, NULL, 0, m.depends, m.size);
+			/* ANSW:no, because in lsmod case only this one is source of true, nothing else present in avl for now */
+			n = alloc_module(m.name, NULL, 0, NULL, m.size);
 		}
 		if (!n) {
 			ULOG_ERR("Failed to allocate memory for module\n");
 			goto out;
 		}
 
+		n->internal_name = strdup(m.name);
 		n->usage = m.usage;
-		n->state = LOADED;
+		n->state |= LOADED;
+		n->rdepends = add_deps(n, m.rdepends);
+		n->size = m.size;
 	}
 	rv = 0;
 out:
@@ -595,8 +658,8 @@ static int scan_module_folder(const char *dir)
 		if (!opts)
 			continue;
 
-		if (*opts == '\x01')
-			m->state = BLACKLISTED;
+		if (*opts == BLACKLISTED_STATE[0])
+			m->state |= BLACKLISTED;
 		else
 			m->opts = strdup(opts);
 	}
@@ -622,7 +685,7 @@ static int scan_module_folders(void)
 
 static int print_modinfo(const struct module *m)
 {
-	const bool is_builtin = (m->state == BUILTIN);
+	const bool is_builtin = ((m->state & BUILTIN) != 0);
 	unsigned int offset, size;
 	struct param *p;
 	struct stat s;
@@ -725,13 +788,13 @@ out:
 
 	return rv;
 }
-
+	
 static int deps_available(struct module *m, int verbose)
 {
 	char *dep;
 	int err = 0;
 
-	if (!m->depends || !strcmp(m->depends, "-") || !strcmp(m->depends, ""))
+	if(!has_deps(m->depends))
 		return 0;
 
 	dep = m->depends;
@@ -741,9 +804,9 @@ static int deps_available(struct module *m, int verbose)
 
 		if (verbose && !m)
 			ULOG_ERR("missing dependency %s\n", dep);
-		if (verbose && m && (m->state != LOADED))
+		if (verbose && m && ((m->state & LOADED) == 0))
 			ULOG_ERR("dependency not loaded %s\n", dep);
-		if (!m || (m->state != LOADED))
+		if (!m || ((m->state & LOADED) == 0))
 			err++;
 		dep += strlen(dep) + 1;
 	}
@@ -809,7 +872,7 @@ static void load_moddeps(struct module *_m)
 
 		if (!m)
 			ULOG_ERR("failed to find dependency %s\n", dep);
-		if (m && (m->state != LOADED)) {
+		if (m && ((m->state & LOADED) == 0)) {
 			m->state = PROBE;
 			load_moddeps(m);
 		}
@@ -830,7 +893,7 @@ static int load_modprobe(bool allow_load_retry)
 		if (mn->is_alias)
 			continue;
 		m = mn->m;
-		if (m->state == PROBE)
+		if (m->state & PROBE)
 			load_moddeps(m);
 	}
 
@@ -842,9 +905,9 @@ static int load_modprobe(bool allow_load_retry)
 			if (mn->is_alias)
 				continue;
 			m = mn->m;
-			if ((m->state == PROBE) && (!deps_available(m, 0)) && (!m->error || load_retry)) {
+			if ((m->state & PROBE) && (!deps_available(m, 0)) && (!m->error || load_retry)) {
 				if (!insert_module(get_module_path(m->name), (m->opts) ? (m->opts) : (""))) {
-					m->state = LOADED;
+					m->state = (m->state | LOADED) & ~PROBE;
 					m->error = 0;
 					loaded++;
 					continue;
@@ -855,7 +918,7 @@ static int load_modprobe(bool allow_load_retry)
 
 			if (m->error)
 				failed++;
-			else if (m->state == PROBE)
+			else if (m->state & PROBE)
 				skipped++;
 		}
 
@@ -981,11 +1044,11 @@ static int main_rmmod(int argc, char **argv)
 		ULOG_ERR("module is not loaded\n");
 		goto err;
 	}
-	if (m->state == BUILTIN) {
+	if (m->state & BUILTIN) {
 		ULOG_ERR("module is builtin\n");
 		goto err;
 	}
-	ret = syscall(__NR_delete_module, m->name, 0);
+	ret = syscall(__NR_delete_module, m->internal_name, 0);
 
 	if (ret)
 		ULOG_ERR("unloading the module failed\n");
@@ -1010,11 +1073,11 @@ static int main_lsmod(int argc, char **argv)
 		if (mn->is_alias)
 			continue;
 		m = mn->m;
-		if (m->state == LOADED) {
+		if (m->state & LOADED) {
 			printf("%-20s%8d%3d ",
 				m->name, m->size, m->usage);
-			if (m->depends && strcmp(m->depends, "-") && strcmp(m->depends, "")) {
-				dep = m->depends;
+			if (m->rdepends && strcmp(m->rdepends, "-") && strcmp(m->rdepends, "")) {
+				dep = m->rdepends;
 				while (*dep) {
 					printf("%s", dep);
 					dep = dep + strlen(dep) + 1;
@@ -1117,13 +1180,13 @@ static int main_modprobe(int argc, char **argv)
 		name = get_module_name(argv[optind]);
 		m = find_module(name);
 
-		if (m && m->state == BLACKLISTED) {
+		if (m && (m->state & BLACKLISTED)) {
 			if (!quiet)
 				ULOG_INFO("%s is blacklisted\n", name);
-		} else if (m && m->state == LOADED) {
+		} else if (m && (m->state & LOADED)) {
 			if (!quiet)
 				ULOG_INFO("%s is already loaded\n", name);
-		} else if (m && m->state == BUILTIN) {
+		} else if (m && (m->state & BUILTIN)) {
 			if (!quiet)
 				ULOG_INFO("%s is builtin\n", name);
 		} else if (!m) {
@@ -1131,7 +1194,7 @@ static int main_modprobe(int argc, char **argv)
 				ULOG_ERR("failed to find a module named %s\n", name);
 			exit_code = -1;
 		} else {
-			m->state = PROBE;
+			m->state |= PROBE;
 		}
 
 		optind++;
@@ -1146,7 +1209,7 @@ static int main_modprobe(int argc, char **argv)
 			if (mn->is_alias)
 				continue;
 			m = mn->m;
-			if ((m->state == PROBE) || m->error)
+			if ((m->state & PROBE) || m->error)
 				ULOG_ERR("- %s\n", m->name);
 		}
 
@@ -1185,11 +1248,79 @@ static int main_loader(int argc, char **argv)
 		ret = -1;
 		goto free_path;
 	}
-
+	
 	if (scan_loaded_modules()) {
 		ret = -1;
 		goto free_path;
 	}
+	// module might be already unloaded from, say, previous call, then rdepends will not obtain 
+	// proper blacklisted flag. To fit rdepends first:
+	avl_for_each_element(&modules, mn, avl) {
+		if (mn->is_alias)
+				continue;
+		m = mn->m;
+
+		char* dep = m->depends;
+
+		while (*dep) {
+			struct module *d = find_module(dep);
+			if (!d) {
+				continue;
+			}
+			// good but not neccessary to look up against internal_name:
+			char *name_to_find = m->internal_name;
+
+			if (!name_to_find) {
+				continue;
+			}
+
+			if (!d->rdepends) {
+				d->rdepends = calloc(1, strlen(name_to_find) + 2);
+				strcpy(d->rdepends, name_to_find);
+				goto next;
+			}
+			char* dep2 = d->rdepends;
+			bool found = false;
+			while (*dep2) {
+				if (!strcmp(dep2, name_to_find)) {
+					found = true;
+					break;
+				}
+				dep2 += strlen(dep2) + 1;
+			}
+			if (!found) {
+				size_t prev_size = dep2 - d->rdepends;
+				d->rdepends = realloc(d->rdepends, prev_size + strlen(name_to_find) + 2);
+				if (!d->rdepends) {
+					return 1;
+				}
+				strcpy(d->rdepends + prev_size, name_to_find);
+				d->rdepends[prev_size + strlen(name_to_find) + 1] = '\0';
+			}
+		next:
+			dep += strlen(dep) + 1;
+		}
+	}
+
+	ULOG_INFO("Unloading blacklisted kernel modules\n");
+
+	avl_for_each_element(&modules, mn, avl) {
+		if (mn->is_alias)
+				continue;
+		m = mn->m;
+
+		//ulog(LOG_DEBUG, "Module '%s' state=%d, deps='%s', rdeps='%s'\n", m->name, m->state, 
+		//		m->depends ? m->depends : "none", m->rdepends ? m->rdepends : "none");
+
+		if (m->state & BLACKLISTED) {
+			// rdepends-based!
+			if (unload_blacklisted(m)) {
+				ULOG_WARN("Unloading fails for '%s'\n", m->name);
+			}
+		}
+	}
+
+	// therefore add forward-based depends step:
 
 	ULOG_INFO("loading kernel modules from %s\n", path);
 
@@ -1208,7 +1339,6 @@ static int main_loader(int argc, char **argv)
 
 		while (getline(&mod, &mod_len, fp) > 0) {
 			char *nl = strchr(mod, '\n');
-			struct module *m;
 			char *opts;
 
 			if (nl)
@@ -1219,8 +1349,14 @@ static int main_loader(int argc, char **argv)
 				*opts++ = '\0';
 
 			m = find_module(get_module_name(mod));
-			if (!m || m->state == LOADED || m->state == BLACKLISTED)
+			if (!m) {
+				ULOG_WARN("Not found '%s'. Seems it is built in\n", mod);
 				continue;
+			}
+
+			if ((m->state & LOADED) || (m->state & BLACKLISTED)) {
+				continue;
+			}
 
 			if (opts) {
 				if (m->opts) {
@@ -1239,7 +1375,8 @@ static int main_loader(int argc, char **argv)
 					m->opts = strdup(opts);
 				}
 			}
-			m->state = PROBE;
+			ULOG_INFO("Try to load %s\n", m->name);
+			m->state |= PROBE;
 			if (basename(gl.gl_pathv[j])[0] - '0' <= 9)
 				load_modprobe(false);
 
@@ -1258,7 +1395,7 @@ static int main_loader(int argc, char **argv)
 			if (mn->is_alias)
 				continue;
 			m = mn->m;
-			if ((m->state == PROBE) || (m->error))
+			if ((m->state & PROBE) || (m->error))
 				ULOG_ERR("- %s - %d\n", m->name, deps_available(m, 1));
 		}
 	} else {
@@ -1336,7 +1473,7 @@ load_options(void)
 			continue;
 
 		if (!strcmp(cmd, "blacklist")) {
-			kvlist_set(&options, mod, "\x01");
+			kvlist_set(&options, mod, BLACKLISTED_STATE);
 			continue;
 		}
 
@@ -1350,7 +1487,7 @@ load_options(void)
 			if (!*s)
 				continue;
 
-			if (prev && prev[0] == '\x01')
+			if (prev && prev[0] == BLACKLISTED_STATE[0])
 				continue;
 
 			if (!prev) {

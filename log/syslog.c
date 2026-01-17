@@ -295,12 +295,15 @@ klog_open(void)
 static int
 syslog_open(void)
 {
-	//unlink(log_dev);
+	unlink(log_dev);
 	syslog_fd.fd = usock(USOCK_UNIX | USOCK_UDP | USOCK_SERVER | USOCK_NONBLOCK, log_dev, NULL);
 	if (syslog_fd.fd < 0) {
 		fprintf(stderr,"Failed to open %s\n", log_dev);
 		return -1;
 	}
+	int opt = 1;
+	setsockopt(syslog_fd.fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+	
 	chmod(log_dev, 0666);
 	uloop_fd_add(&syslog_fd, ULOOP_READ | ULOOP_EDGE_TRIGGER);
 
@@ -402,6 +405,7 @@ log_shutdown(void)
 {
 	if (syslog_fd.registered) {
 		uloop_fd_delete(&syslog_fd);
+		shutdown(syslog_fd.fd, SHUT_RDWR);
 		close(syslog_fd.fd);
 	}
 
