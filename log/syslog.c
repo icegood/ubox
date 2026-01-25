@@ -27,6 +27,7 @@
 #include <syslog.h>
 #include <errno.h>
 #include <ctype.h>
+#include <stdalign.h>
 
 #include <libubox/uloop.h>
 #include <libubox/usock.h>
@@ -42,12 +43,18 @@
 
 #define KLOG_DEFAULT_PROC	"/proc/kmsg"
 
-#define PAD(x) (x % 4) ? (((x) - (x % 4)) + 4) : (x)
+// n must be power of two and it is guaranteed in gnu11
+#define PAD(x, n) ((((uintptr_t)x) + n - 1) & (-n))
+
+#define  BUFFER_OFFSET2(x, base) (unsigned)((char *)x-(char *)base)
+#define  BUFFER_OFFSET(x) BUFFER_OFFSET2(x, log)
 
 static char *log_dev = LOG_DEFAULT_SOCKET;
 static int log_size = LOG_DEFAULT_SIZE;
-static struct log_head *log, *log_end, *oldest, *newest;
-static int current_id = 0;
+// invariant for log_tail_start: always not less than log_end
+static struct log_head *log, *log_max, *log_tail_start, *log_tail_end, *log_end;
+static unsigned int discard_count, buffer_rounds;
+static unsigned int current_id = 0;
 static regex_t pat_prio;
 static regex_t pat_tstamp;
 int max_log_priority;
@@ -89,9 +96,7 @@ static struct udebug_ubus_ring rings[] = {
 static struct log_head*
 log_next(struct log_head *h, int size)
 {
-	struct log_head *n = (struct log_head *) &h->data[PAD(size)];
-
-	return (n >= log_end) ? (log) : (n);
+	return (struct log_head *) PAD(&h->data[size], alignof(struct log_head));
 }
 
 static uint64_t
@@ -196,32 +201,53 @@ log_add(char *buf, int size, int source)
 	if (LOG_PRI(fac_priority) > max_log_priority) {
 		return;
 	}
+	
+	next = log_next(log_end, size);
+	if (BUFFER_OFFSET2(next,log_end) > log_size) {
+		return; // refuse to log this
+	}
+	
+	if (next >= log_max) {
+		// whole old tail is discarded:
+		discard_count += log->id - (log_tail_start < log_tail_end ? log_tail_start->id : 0);
+		log_tail_end = log_end;
+		// wrap
+		log_end = log_tail_start = log;
+		next = log_next(log, size); // < log_max - invariant
+		buffer_rounds++;
+	}
 
-	/* find new oldest entry */
-	next = log_next(newest, size);
-	if (next > newest) {
-		while ((oldest > newest) && (oldest <= next) && (oldest != log))
-			oldest = log_next(oldest, oldest->size);
-	} else {
-		fprintf(stderr, "Log buffer wrap\n");
-		newest->size = 0;
-		next = log_next(log, size);
-		for (oldest = log; oldest <= next; oldest = log_next(oldest, oldest->size))
-			;
-		newest = log;
+	while (log_tail_start < next) {
+			discard_count++;
+			log_tail_start = log_next(log_tail_start, log_tail_start->size);
+			if (log_tail_start >= log_tail_end) {
+				log_tail_end = log_tail_start = log_max;
+				break;
+			}
 	}
 
 	/* add the log message */
-	newest->size = size;
-	newest->id = current_id++;
-	newest->priority = fac_priority;
-	newest->source = source;
-	clock_gettime(CLOCK_REALTIME, &newest->ts);
-	strcpy(newest->data, buf);
+	log_end->id = current_id++;
+	log_end->size = size;
+	log_end->priority = fac_priority;
+	log_end->source = source;
+	clock_gettime(CLOCK_REALTIME, &log_end->ts);
+	strcpy(log_end->data, buf);
 
-	ubus_notify_log(newest);
+	ubus_notify_log(log_end);
 
-	newest = next;
+	log_end = next;
+}
+
+void log_print_state() {
+	fprintf(stderr, "discard_count=%u,buffer_rounds=%u,end=%u,tail start=%u,tail end=%u,max=%u\n", 
+		discard_count,
+		buffer_rounds,
+		BUFFER_OFFSET(log_end),
+		BUFFER_OFFSET(log_tail_start),
+		BUFFER_OFFSET(log_tail_end),
+		BUFFER_OFFSET(log_max)
+	);
 }
 
 static void
@@ -319,20 +345,26 @@ log_list(int count, struct log_head *h)
 
 	if (count)
 		min = (count < current_id) ? (current_id - count) : (0);
-	if (!h && oldest->id >= min)
-		return oldest;
-	if (!h)
-		h = oldest;
 
-	while (h != newest) {
-		h = log_next(h, h->size);
-		if (!h->size && (h > newest))
-			h = log;
-		if (h->id >= min && (h != newest))
+	while (true) {
+		if (h) {
+			h = log_next(h, h->size);
+			if (h == log_end) {
+				return NULL;
+			}
+		} else {
+			h = log_tail_start; // could be log_end, but valid one
+		}
+		// tail processing:
+		if (h >= log_tail_end) {
+			h = log; // move to head part
+			if (h == log_end) {
+				return NULL; // no logs yet at all
+			}
+		}
+		if (h->id >= min)
 			return h;
 	}
-
-	return NULL;
 }
 
 int
@@ -345,26 +377,9 @@ log_buffer_init(int size)
 		return -1;
 	}
 
-	if (log && ((log_size + sizeof(struct log_head)) < size)) {
-		struct log_head *start = _log;
-		struct log_head *end = ((void*) _log) + size;
-		struct log_head *l;
-
-		l = log_list(0, NULL);
-		while ((start < end) && l && l->size) {
-			memcpy(start, l, PAD(sizeof(struct log_head) + l->size));
-			start = (struct log_head *) &l->data[PAD(l->size)];
-			l = log_list(0, l);
-		}
-		free(log);
-		newest = start;
-		newest->size = 0;
-		oldest = log = _log;
-		log_end = ((void*) log) + size;
-	} else {
-		oldest = newest = log = _log;
-		log_end = ((void*) log) + size;
-	}
+	log_end = log = _log;
+	log_max = ((void*) log) + size;
+	log_tail_end = log_tail_start = log_max;
 	log_size = size;
 
 	return 0;

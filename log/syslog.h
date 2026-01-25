@@ -48,5 +48,6 @@ void log_add(char *buf, int size, int source);
 void ubus_notify_log(struct log_head *l);
 void log_udebug_config(struct udebug_ubus *ctx, struct blob_attr *data,
 		       bool enabled);
+void log_print_state();
 
 #endif

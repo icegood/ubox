@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.10)
 
 PROJECT(ubox C)
-ADD_DEFINITIONS(-Os -ggdb -Wall -Werror --std=gnu99 -Wmissing-declarations)
+ADD_DEFINITIONS(-Os -ggdb -Wall -Werror --std=gnu11 -Wmissing-declarations)
 
 SET(CMAKE_SHARED_LIBRARY_LINK_C_FLAGS "")
 

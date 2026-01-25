@@ -11,18 +11,18 @@
  * GNU General Public License for more details.
  */
 
-#include <sys/types.h>
 #include <pwd.h>
 #include <stdio.h>
-#include <unistd.h>
+#include <signal.h>
 #include <syslog.h>
 #include <unistd.h>
 
+#include <sys/types.h>
 #include <linux/types.h>
 
-#include <libubox/uloop.h>
 #include <libubox/blobmsg.h>
 #include <libubox/list.h>
+#include <libubox/uloop.h>
 #include <libubox/ustream.h>
 #include <libubox/utils.h>
 #include <libubus.h>
@@ -238,6 +238,19 @@ ubus_connect_handler(struct ubus_context *ctx)
 	fprintf(stderr, "log: connected to ubus\n");
 }
 
+static void get_stat(struct uloop_signal *s) {
+	log_print_state();
+}
+
+static int signals() {
+	static struct uloop_signal sigusr1 = { .signo = SIGUSR1, .cb = get_stat };
+	if (uloop_signal_add(&sigusr1) < 0) {
+		return 1;
+	}
+
+	return 0;
+}
+
 static int usage(const char *prog)
 {
 	fprintf(stderr, "Usage: %s [options]\n"
@@ -270,8 +283,12 @@ main(int argc, char **argv)
 	}
 	log_size *= 1024;
 
+	if (signals()) {
+		return 1;
+	}
 	uloop_init();
 	log_init(log_size);
+	
 	conn.cb = ubus_connect_handler;
 	ubus_auto_connect(&conn);
 	udebug_ubus_init(&udebug, &conn.ctx, "log", log_udebug_config);
