@@ -1068,13 +1068,13 @@ static int main_lsmod(int argc, char **argv)
 
 	if (scan_loaded_modules())
 		return -1;
-
+	printf("%-20s|%-8s|%-6s|%s\n", "NAME", "SIZE", "USAGE", "DEPENDS");
 	avl_for_each_element(&modules, mn, avl) {
 		if (mn->is_alias)
 			continue;
 		m = mn->m;
 		if (m->state & LOADED) {
-			printf("%-20s%8d%3d ",
+			printf("%-20s|%8d|%6d|",
 				m->name, m->size, m->usage);
 			if (m->rdepends && strcmp(m->rdepends, "-") && strcmp(m->rdepends, "")) {
 				dep = m->rdepends;
