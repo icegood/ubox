@@ -335,6 +335,8 @@ syslog_open(void)
 
 	fprintf(stderr,"Socket '%s' opened\n", log_dev);
 
+	openlog("sysinit", LOG_PID | LOG_CONS, LOG_DAEMON);
+
 	return 0;
 }
 
@@ -412,7 +414,6 @@ log_init(int _log_size)
 
 	syslog_open();
 	klog_open();
-	openlog("sysinit", LOG_CONS, LOG_DAEMON);
 }
 
 void

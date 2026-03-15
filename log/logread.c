@@ -23,6 +23,7 @@
 #include <libubox/blobmsg_json.h>
 #include <libubox/list.h>
 #include <libubox/ustream.h>
+#include <libubox/ulog.h>
 #include <libubox/utils.h>
 #include <libubus.h>
 
@@ -298,7 +299,7 @@ int main(int argc, char **argv)
 
 	signal(SIGPIPE, SIG_IGN);
 
-	openlog("logread", LOG_PID, LOG_DAEMON); // default mask is 255 i.e. log all
+	ulog_open(ULOG_SYSLOG, LOG_DAEMON, "logread");
 
 	while ((ch = getopt(argc, argv, "u0fcs:l:z:Z:Y:r:F:p:S:P:h:e:t")) != -1) {
 		switch (ch) {
@@ -403,6 +404,7 @@ int main(int argc, char **argv)
 
 	if (log_follow && pid_file)
 		unlink(pid_file);
+	ulog_close();
 
 	return 0;
 }
