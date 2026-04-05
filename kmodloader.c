@@ -862,7 +862,7 @@ static void load_moddeps(struct module *_m)
 	char *dep;
 	struct module *m;
 
-	if (!strcmp(_m->depends, "-") || !strcmp(_m->depends, ""))
+	if (!has_deps(_m->depends))
 		return;
 
 	dep = _m->depends;
@@ -1261,7 +1261,9 @@ static int main_loader(int argc, char **argv)
 		m = mn->m;
 
 		char* dep = m->depends;
-
+		if (!has_deps(dep)) {
+			continue;
+		}
 		while (*dep) {
 			struct module *d = find_module(dep);
 			if (!d) {
